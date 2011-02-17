@@ -131,6 +131,82 @@ Datum prefix_range_inter(PG_FUNCTION_ARGS);
 #define PG_GETARG_PREFIX_RANGE_P(n)	  DatumGetPrefixRange(PG_DETOAST_DATUM(PG_GETARG_DATUM(n)))
 #define PG_RETURN_PREFIX_RANGE_P(x)	  return PrefixRangeGetDatum(x)
 
+static char * get_joined(char *prefix, char range_part) {
+  if (range_part) {
+    int plen = strlen(prefix);
+    char *res = (char*) palloc(plen + 2);
+    memcpy(res, prefix, plen);
+    res[plen] = range_part;
+    res[plen+1] = 0;
+    return res;
+  } else {
+    return prefix;
+  }
+}
+
+static void free_joined(char *str, prefix_range *p) {
+  if ( str != p->prefix ) {
+    pfree((void*)str);
+  }
+}
+
+typedef struct {
+  char *first;
+  char *last;
+  int   len;
+} first_last;
+
+static inline
+void fstlst_init(first_last *fl, prefix_range *pr) {
+  fl->first = get_joined(pr->prefix, pr->first);
+  fl->last  = get_joined(pr->prefix, pr->last);
+  fl->len   = strlen(fl->first);
+}
+
+static inline
+void fstlst_free(first_last *fl, prefix_range *pr) {
+  free_joined(fl->first, pr);
+  free_joined(fl->last, pr);
+}
+
+/**
+ * compare 2 raw string
+ */
+static inline
+int memcmp2(char *left, char *right, int llen, int rlen) {
+  int minlen = llen <= rlen ? llen : rlen;
+  int cmp = memcmp(left, right, minlen);
+  return cmp ? cmp : llen - rlen;
+}
+
+/**
+ * compare raw string with incremented string
+ */
+static inline
+int memcmp_inc(char *left, char *right, int llen, int rlen) {
+  int minlen = llen <= rlen ? llen : rlen;
+  int cmp = memcmp(left, right, minlen - 1);
+  if ( cmp )
+    return cmp;
+  else
+    return left[minlen - 1] - right[minlen - 1] - (llen > rlen ? 1 : 0);
+}
+
+/**
+ * compare two incremented strings
+ */
+static inline
+int memcmp_inc_inc(char *left, char *right, int llen, int rlen) {
+  int minlen = llen <= rlen ? llen : rlen;
+  int cmp = memcmp(left, right, minlen - 1);
+  if ( cmp )
+    return cmp;
+  else {
+    int sig = llen > rlen ? 1 : (llen < rlen ? -1 : 0);
+    return left[minlen - 1] - right[minlen - 1] - sig;
+  }
+}
+
 /**
  * Used by prefix_contains_internal and pr_contains_prefix.
  *
@@ -189,6 +265,20 @@ prefix_range *build_pr(const char *prefix, char first, char last) {
 #endif
 
   return pr;
+}
+
+/**
+ * Helper function which builds a prefix_range from first and last string
+ */
+static inline
+prefix_range *from_first_last(char* first, int flen, char* last, int llen) {
+  char *gp = __greater_prefix(first, last, flen, llen);
+  int gplen = strlen(gp);
+  if (gplen == flen || gplen == llen) {
+    return build_pr(gp, 0, 0);
+  } else {
+    return build_pr(gp, first[gplen], last[gplen]);
+  }
 }
 
 /**
@@ -446,17 +536,6 @@ int pr_length(prefix_range *pr) {
   return len;
 }
 
-static inline
-bool pr_eq(prefix_range *a, prefix_range *b) {
-  int sa = strlen(a->prefix);
-  int sb = strlen(b->prefix);
-
-  return sa == sb
-    && memcmp(a->prefix, b->prefix, sa) == 0
-    && a->first == b->first 
-    && a->last  == b->last;
-}
-
 /*
  * We invent a prefix_range ordering for convenience, but that's
  * dangerous. Use the BTree opclass at your own risk.
@@ -468,67 +547,25 @@ bool pr_eq(prefix_range *a, prefix_range *b) {
  * Baring bug, the constraint is to have non-overlapping data.
  */
 
-/*static inline
-bool pr_lt(prefix_range *a, prefix_range *b, bool eqval) {
-*/
-
 static inline
 int pr_cmp(prefix_range *a, prefix_range *b) {
   int cmp = 0;
-  int alen = strlen(a->prefix);
-  int blen = strlen(b->prefix);
-  int mlen = alen; /* minimum length */
-  char *p  = a->prefix;
-  char *q  = b->prefix;
+  first_last afl, bfl;
+  fstlst_init(&afl, a);
+  fstlst_init(&bfl, b);
 
-  /*
-   * First case, common prefix length
-   */
-  if( alen == blen ) {
-    cmp = memcmp(p, q, alen);
+  cmp = strcmp(afl.first, bfl.first);
+  if (cmp == 0) cmp = strcmp(afl.last, bfl.last);
 
-    /* Uncommon prefix, easy to compare */
-    if( cmp != 0 ) 
-      return cmp;
-
-    /* Common prefix, check for (sub)ranges */
-    else
-      return (a->first == b->first) ? (a->last - b->last) : (a->first - b->first);
-  }
-
-  /* For memcmp() safety, we need the minimum length */
-  if( mlen > blen )
-    mlen = blen;
-
-  /*
-   * Don't forget we may have [x-y] prefix style, that's empty prefix, only range.
-   */
-  if( alen == 0 && a->first != 0 ) {
-    /* return (eqval ? (a->first <= q[0]) : (a->first < q[0])); */
-    return a->first - q[0];
-  }
-  else if( blen == 0 && b->first != 0 ) {
-    /* return (eqval ? (p[0] <= b->first) : (p[0] < b->first)); */
-    return p[0] - b->first;
-  }
-
-  /*
-   * General case
-   *
-   * When memcmp() on the shorter of p and q returns 0, that means they
-   * share a common prefix: avoid to say that '93' < '9377' and '9377' <
-   * '93'.
-   */
-  cmp = memcmp(p, q, mlen);
+  fstlst_free(&afl, a);
+  fstlst_free(&bfl, b);
   
-  if( cmp == 0 )
-    /*
-     * we are comparing e.g. '1' and '12' (the shorter contains the
-     * smaller), so let's pretend '12' < '1' as it contains less elements.
-     */
-    return (alen == mlen) ? 1 : -1;
-
   return cmp;
+}
+
+static inline
+bool pr_eq(prefix_range *a, prefix_range *b) {
+  return pr_cmp(a, b) == 0;
 }
 
 static inline
@@ -545,30 +582,23 @@ bool pr_gt(prefix_range *a, prefix_range *b, bool eqval) {
 
 static inline
 bool pr_contains(prefix_range *left, prefix_range *right, bool eqval) {
-  int sl;
-  int sr;
-  bool left_prefixes_right;
+  bool res = false;
+  first_last lfl, rfl;
+  fstlst_init(&lfl, left);
+  fstlst_init(&rfl, right);
 
-  if( pr_eq(left, right) )
-    return eqval;
+  if (rfl.len >= lfl.len) {
+    int first_cmp = memcmp2(lfl.first, rfl.first, lfl.len, rfl.len);
+    int last_cmp = memcmp_inc_inc(lfl.last, rfl.last, lfl.len, rfl.len);
 
-  sl = strlen(left->prefix);
-  sr = strlen(right->prefix);
-
-  if( sr < sl )
-    return false;
-
-  left_prefixes_right = memcmp(left->prefix, right->prefix, sl) == 0;
-
-  if( left_prefixes_right ) {
-    if( sl == sr )
-      return left->first == 0 ||
-	(left->first <= right->first && left->last >= right->last);
-
-    return left->first == 0 ||
-      (left->first <= right->prefix[sl] && right->prefix[sl] <= left->last);
+    if ( first_cmp <= 0 && last_cmp >= 0 )
+      res = eqval || first_cmp < 0 || last_cmp > 0;
   }
-  return false;
+
+  fstlst_free(&lfl, left);
+  fstlst_free(&rfl, right);
+
+  return res;
 }
 
 /**
@@ -576,153 +606,86 @@ bool pr_contains(prefix_range *left, prefix_range *right, bool eqval) {
  */
 static inline
 bool pr_contains_prefix(prefix_range *pr, text *query, bool eqval) {
-  int plen = strlen(pr->prefix);
+  bool res = false;
   int qlen = PREFIX_VARSIZE(query);
-  char *p  = pr->prefix;
   char *q  = (char *)PREFIX_VARDATA(query);
+  first_last fl;
+  fstlst_init(&fl, pr);
 
-  if( __prefix_contains(p, q, plen, qlen) ) {
-    if( pr->first == 0 || qlen == plen ) {
-      return eqval;
-    }
-
-    /**
-     * __prefix_contains() is true means qlen >= plen, and previous
-     * test ensures qlen != plen, we hence assume qlen > plen.
-     */
-    Assert(qlen > plen);
-    return pr-> first <= q[plen] && q[plen] <= pr->last;
+  if ( fl.len <= qlen ) {
+    int first_cmp = memcmp2(fl.first, q, fl.len, qlen);
+    int last_cmp = memcmp_inc_inc(fl.last, q, fl.len, qlen);
+    
+    if ( first_cmp <= 0 && last_cmp >= 0 )
+      res = eqval || first_cmp < 0 || last_cmp > 0;
   }
-  return false;
+
+  fstlst_free(&fl, pr);
+  return res;
 }
 
 static 
 prefix_range *pr_union(prefix_range *a, prefix_range *b) {
   prefix_range *res = NULL;
-  int alen = strlen(a->prefix);
-  int blen = strlen(b->prefix);
-  char *gp = NULL;
-  int gplen;
-  char min, max;
+  first_last afl, bfl;
+  char *first, *last;
+  int mlen, fcmp, lcmp, flen, llen;
 
-  if( 0 == alen && 0 == blen ) {
-    res = build_pr("",
-		   a->first <= b->first ? a->first : b->first,
-		   a->last  >= b->last  ? a->last : b->last);
-    return pr_normalize(res);
-  }
+  fstlst_init(&afl, a);
+  fstlst_init(&bfl, b);
 
-  gp = __greater_prefix(a->prefix, b->prefix, alen, blen);
-  gplen = strlen(gp);
+  mlen = afl.len <= bfl.len ? afl.len : bfl.len;
 
-  if( gplen == 0 ) {
-    res = build_pr("", 0, 0);
-    if( alen > 0 && blen > 0 ) {
-      res->first = a->prefix[0];
-      res->last  = b->prefix[0];
-    }
-    else if( alen == 0 ) {
-      res->first = a->first <= b->prefix[0] ? a->first : b->prefix[0];
-      res->last  = a->last  >= b->prefix[0] ? a->last  : b->prefix[0];
-    }
-    else if( blen == 0 ) {
-      res->first = b->first <= a->prefix[0] ? b->first : a->prefix[0];
-      res->last  = b->last  >= a->prefix[0] ? b->last  : a->prefix[0];
-    }
-  }
-  else {
-    res = build_pr(gp, 0, 0);
+  fcmp = memcmp2(afl.first, bfl.first, afl.len, bfl.len);
+  first = fcmp <= 0 ? afl.first : bfl.first;
+  flen  = fcmp <= 0 ? afl.len : bfl.len;
 
-    if( gplen == alen && alen == blen ) {
-      res->first = a->first <= b->first ? a->first : b->first;
-      res->last  = a->last  >= b->last  ? a->last : b->last;
-    }
-    else if( gplen == alen ) {
-      Assert(alen < blen);
-      res->first = a->first <= b->prefix[alen] ? a->first : b->prefix[alen];
-      res->last  = a->last  >= b->prefix[alen] ? a->last  : b->prefix[alen];
-    }
-    else if( gplen == blen ) {
-      Assert(blen < alen);
-      res->first = b->first <= a->prefix[blen] ? b->first : a->prefix[blen];
-      res->last  = b->last  >= a->prefix[blen] ? b->last  : a->prefix[blen];
-    }
-    else {
-      Assert(gplen < alen && gplen < blen);
-      min = a->prefix[gplen];
-      max = b->prefix[gplen];
+  lcmp = memcmp_inc_inc(afl.last, bfl.last, afl.len, bfl.len);
+  last = lcmp >= 0 ? afl.last : bfl.last;
+  llen = lcmp >= 0 ? afl.len : bfl.len;
 
-      if( min > max ) {
-	min = b->prefix[gplen];
-	max = a->prefix[gplen];
-      }
-      res->first = min;
-      res->last  = max;
+  res = from_first_last(first, flen, last, llen);
+
+  fstlst_free(&afl, a);
+  fstlst_free(&bfl, b);
+
 #ifdef DEBUG_UNION
     elog(NOTICE, "union a: %s %d %d", a->prefix, a->first, a->last);
     elog(NOTICE, "union b: %s %d %d", b->prefix, b->first, b->last);
     elog(NOTICE, "union r: %s %d %d", res->prefix, res->first, res->last);
 #endif
-    }
-  }
   return pr_normalize(res);
 }
 
 static inline
 prefix_range *pr_inter(prefix_range *a, prefix_range *b) {
   prefix_range *res = NULL;
-  int alen = strlen(a->prefix);
-  int blen = strlen(b->prefix);
-  char *gp = NULL;
-  int gplen;
+  first_last afl, bfl;
+  char *first, *last;
+  int fcmp, lcmp, flen, llen;
 
-  if( 0 == alen && 0 == blen ) {
-    res = build_pr("",
-		   a->first > b->first ? a->first : b->first,
-		   a->last  < b->last  ? a->last  : b->last);
-    return pr_normalize(res);
+  fstlst_init(&afl, a);
+  fstlst_init(&bfl, b);
+
+  fcmp = memcmp_inc(afl.first, bfl.last, afl.len, bfl.len);
+  lcmp = memcmp_inc(bfl.first, afl.last, bfl.len, afl.len);
+
+  if ( fcmp <= 0 && lcmp <= 0 ) {
+    fcmp = memcmp2(afl.first, bfl.first, afl.len, bfl.len);
+    first = fcmp >= 0 ? afl.first : bfl.first;
+    flen  = fcmp >= 0 ? afl.len : bfl.len;
+
+    lcmp = memcmp_inc_inc(afl.last, bfl.last, afl.len, bfl.len);
+    last = lcmp <= 0 ? afl.last : bfl.last;
+    llen = lcmp <= 0 ? afl.len : bfl.len;
+
+    res = from_first_last(first, flen, last, llen);
+  } else {
+    res = build_pr("", 0, 0);
   }
 
-  gp = __greater_prefix(a->prefix, b->prefix, alen, blen);
-  gplen = strlen(gp);
-
-  if( gplen != alen && gplen != blen ) {
-    return build_pr("", 0, 0);
-  }
-
-  if( gplen == alen && 0 == alen ) {
-    if( a->first <= b->prefix[0] && b->prefix[0] <= a->last ) {      
-      res = build_pr(b->prefix, b->first, b->last);
-    }
-    else
-      res = build_pr("", 0, 0);
-  }
-  else if( gplen == blen && 0 == blen ) {
-    if( b->first <= a->prefix[0] && a->prefix[0] <= b->last ) {      
-      res = build_pr(a->prefix, a->first, a->last);
-    }
-    else
-      res = build_pr("", 0, 0);
-  }
-  else if( gplen == alen && alen == blen ) {
-    res = build_pr(gp,
-		   a->first > b->first ? a->first : b->first,
-		   a->last  > b->last  ? a->last  : b->last);
-
-#ifdef DEBUG_INTER
-    elog(NOTICE, "inter a: %s %d %d", a->prefix, a->first, a->last);
-    elog(NOTICE, "inter b: %s %d %d", b->prefix, b->first, b->last);
-    elog(NOTICE, "inter r: %s %d %d", res->prefix, res->first, res->last);
-#endif
-  }
-  else if( gplen == alen ) {
-    Assert(gplen < blen);
-    res = build_pr(b->prefix, b->first, b->last);
-  }
-  else if( gplen == blen ) {
-    Assert(gplen < alen);
-    res = build_pr(a->prefix, a->first, a->last);
-  }
+  fstlst_free(&afl, a);
+  fstlst_free(&bfl, b);
 
   return pr_normalize(res);
 }
