@@ -129,7 +129,11 @@ Datum prefix_range_inter(PG_FUNCTION_ARGS);
 #define DatumGetPrefixRange(X)	          ((prefix_range *) PREFIX_VARDATA(DatumGetPointer(X)) )
 #define PrefixRangeGetDatum(X)	          PointerGetDatum(make_varlena(X))
 #define PG_GETARG_PREFIX_RANGE_P(n)	  DatumGetPrefixRange(PG_DETOAST_DATUM(PG_GETARG_DATUM(n)))
-#define PG_RETURN_PREFIX_RANGE_P(x)	  return PrefixRangeGetDatum(x)
+#define PG_RETURN_PREFIX_RANGE_P(x)       do { \
+  prefix_range *X = (x); \
+  if ( X ) return PrefixRangeGetDatum(X); \
+  else PG_RETURN_NULL(); \
+} while(0)
 
 static char * get_joined(char *prefix, char range_part) {
   if (range_part) {
@@ -680,14 +684,12 @@ prefix_range *pr_inter(prefix_range *a, prefix_range *b) {
     llen = lcmp <= 0 ? afl.len : bfl.len;
 
     res = from_first_last(first, flen, last, llen);
-  } else {
-    res = build_pr("", 0, 0);
   }
 
   fstlst_free(&afl, a);
   fstlst_free(&bfl, b);
 
-  return pr_normalize(res);
+  return res ? pr_normalize(res) : NULL;
 }
 
 /**
@@ -697,7 +699,7 @@ static inline
 bool pr_overlaps(prefix_range *a, prefix_range *b) {
   prefix_range *inter = pr_inter(a, b);
 
-  return strlen(inter->prefix) > 0 || (inter->first != 0 && inter->last != 0);
+  return inter != NULL;
 }
 
 
