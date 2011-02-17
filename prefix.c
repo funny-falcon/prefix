@@ -675,7 +675,7 @@ prefix_range *pr_inter(prefix_range *a, prefix_range *b) {
   fcmp = memcmp_inc(afl.first, bfl.last, afl.len, bfl.len);
   lcmp = memcmp_inc(bfl.first, afl.last, bfl.len, afl.len);
 
-  if ( fcmp <= 0 && lcmp <= 0 ) {
+  if ( fcmp < 0 && lcmp < 0 ) {
     fcmp = memcmp2(afl.first, bfl.first, afl.len, bfl.len);
     first = fcmp >= 0 ? afl.first : bfl.first;
     flen  = fcmp >= 0 ? afl.len : bfl.len;
