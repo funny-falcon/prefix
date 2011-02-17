@@ -192,8 +192,10 @@ int memcmp_inc(char *left, char *right, int llen, int rlen) {
   int cmp = memcmp(left, right, minlen - 1);
   if ( cmp )
     return cmp;
-  else
-    return left[minlen - 1] - right[minlen - 1] - (llen > rlen ? 1 : 0);
+  else {
+    cmp = left[minlen - 1] - right[minlen - 1] - (llen >= rlen ? 1 : 0);
+    return cmp ? cmp : llen - rlen;
+  }
 }
 
 /**
